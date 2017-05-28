@@ -1,0 +1,26 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+imports:
+  - http://www.getcloudify.org/spec/cloudify/4.1m1/types.yaml
+
+plugins:
+  paramiko:
+    source: paramiko
+    executor: central_deployment_agent
+
+
+node_templates:
+  vm1:
+    type: cloudify.nodes.Root
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: paramiko.paramiko_plugin.tasks.run_script
+          inputs:
+            script_path: foo.py
+            ssh_env:
+              username: vagrant
+              port: 22
+              key_filename: /home/lukasz/projects/cli_work/vm/.vagrant/machines/default/virtualbox/private_key
+              hostname: 10.0.1.25
+              look_for_keys: false

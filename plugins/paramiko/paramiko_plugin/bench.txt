@@ -1,0 +1,4 @@
+paramiko 1thread: CFY_WORKDIR=/home/lukasz/.cloudify_vagrant cfy bootstrap -i      23.73s user 1.06s system 5% cpu 7:05.36 total
+fabric: CFY_WORKDIR=/home/lukasz/.cloudify_vagrant cfy bootstrap -i      23.32s user 4.38s system 4% cpu 9:14.22 total
+paramiko 10threads: CFY_WORKDIR=/home/lukasz/.cloudify_vagrant cfy bootstrap -i      24.88s user 2.33s system 7% cpu 6:23.44 total
+paramiko 2threads: CFY_WORKDIR=/home/lukasz/.cloudify_vagrant cfy bootstrap -i      21.25s user 1.22s system 6% cpu 5:32.13 total

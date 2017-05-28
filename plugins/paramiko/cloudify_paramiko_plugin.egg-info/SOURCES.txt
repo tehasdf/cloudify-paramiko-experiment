@@ -1,0 +1,6 @@
+cloudify_paramiko_plugin.egg-info/PKG-INFO
+cloudify_paramiko_plugin.egg-info/SOURCES.txt
+cloudify_paramiko_plugin.egg-info/dependency_links.txt
+cloudify_paramiko_plugin.egg-info/top_level.txt
+paramiko_plugin/__init__.py
+paramiko_plugin/tasks.py
