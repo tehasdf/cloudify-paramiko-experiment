@@ -22,6 +22,13 @@ ILLEGAL_CTX_OPERATION_ERROR = RuntimeError('ctx may only abort or return once')
 _NOTHING = object()
 
 
+class RemoteProcessError(Exception):
+    def __init__(self, stdout, stderr):
+        super(RemoteProcessError, self).__init__()
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 class NetstringMultiCtxProxy(object):
     def __init__(self):
         self.contexts = {}
@@ -82,11 +89,11 @@ def handle_script_result(ctx):
 
 
 class _CtxWrapper(object):
-    def __init__(self, ctx, client, remote_base_dir=None):
+    def __init__(self, ctx, client, remote_work_dir):
         self._ctx = ctx
         self._return_value = _NOTHING
         self._client = client
-        self._remote_base_dir = remote_base_dir
+        self._remote_work_dir = remote_work_dir
 
     def __getattr__(self, k):
         return getattr(self._ctx, k)
@@ -116,11 +123,8 @@ class _CtxWrapper(object):
         local_target_path = self._ctx.download_resource(resource_path)
         remote_target_path = self._get_remote_target_path(
             local_target_path, target_path)
-        sftp = self._client.open_sftp()
-        try:
+        with self._client.open_sftp() as sftp:
             sftp.put(local_target_path, remote_target_path)
-        finally:
-            sftp.close()
         return remote_target_path
 
     def download_resource_and_render(self,
@@ -132,28 +136,16 @@ class _CtxWrapper(object):
             template_variables=template_variables)
         remote_target_path = self._get_remote_target_path(
             local_target_path, target_path)
-        sftp = self._client.open_sftp()
-        try:
+        with self._client.open_sftp() as sftp:
             sftp.put(local_target_path, remote_target_path)
-        finally:
-            sftp.close()
         return remote_target_path
 
     def _get_remote_target_path(self, local_target_path, target_path=None):
         if target_path:
             return target_path
         else:
-            remote_work_dir = self._get_work_dir()
-            self._client.exec_command('mkdir -p {0}'.format(remote_work_dir))
             return os.path.join(
-                remote_work_dir, os.path.basename(local_target_path))
-
-    def _get_work_dir(self):
-        if self._remote_base_dir is None:
-            _in, out, _err = self._client.exec_command('mktemp -d')
-            self._remote_base_dir = out.read().strip()
-        remote_work_dir = os.path.join(self._remote_base_dir, 'work')
-        return remote_work_dir
+                self._remote_work_dir, os.path.basename(local_target_path))
 
 
 def with_client(f):
@@ -200,59 +192,85 @@ def with_client(f):
     return _inner
 
 
+def _run_command(client, cmd, stdin=None, env=None):
+    if env is None:
+        env = {}
+    env_script = None
+    if env:
+        env_script, env_err = _run_command(client, 'mktemp')
+        env_script = env_script.strip()
+        with client.open_sftp() as sftp:
+            with sftp.open(env_script, 'w') as f:
+                for k, v in env.items():
+                    f.write('export {0}={1}\n'.format(k, v))
+        cmd = 'source {0} && {1}'.format(env_script, cmd)
+
+    cmd_in, cmd_out, cmd_err = client.exec_command(cmd)
+    if stdin:
+        cmd_in.write(stdin)
+    out = cmd_out.read()
+    err = cmd_err.read()
+    status = cmd_out.channel.recv_exit_status(),
+    if env_script:
+        _run_command(client, 'rm {0}'.format(env_script))
+    if status != 0:
+        raise RemoteProcessError(cmd)
+    return out, err
+
+
 @with_client
 def run_script(ctx, script_path, client, proxy, env=None, use_sudo=False,
                stdin=None, **kwargs):
-    _in, out, _err = client.exec_command('mktemp -d --tmpdir=/tmp cfy.XXXXXX')
-    base_dir = out.read().strip()
-    sftp = client.open_sftp()
+    base_dir = '/tmp/cloudify-ctx'
+    work_dir = os.path.join(base_dir, 'work')
+
     proxy_client_path = proxy_client.__file__
     if proxy_client_path.endswith('.pyc'):
         proxy_client_path = proxy_client_path[:-1]
     local_ctx_py_path = os.path.join(
         os.path.dirname(cloudify.ctx_wrappers.__file__), 'ctx-py.py')
     script_path = get_script(ctx.download_resource, script_path)
-    script_filename = os.path.basename(script_path)
-    for filename, target_filename in [
-            (script_path, script_filename),
-            (proxy_client_path, 'ctx'),
-            (local_ctx_py_path, 'cloudify.py')]:
-        remote_script_path = os.path.join(base_dir, target_filename)
-        sftp.put(filename, remote_script_path)
-        client.exec_command('chmod +x {0}'.format(remote_script_path))
+    remote_ctx_path = os.path.join(base_dir, 'ctx')
+    try:
+        _run_command(client, 'test -e {0}'.format(remote_ctx_path))
+    except RemoteProcessError:
+        _run_command(client, 'mkdir -p {0}'.format(work_dir))
+        with client.open_sftp() as sftp:
+            sftp.put(proxy_client_path, remote_ctx_path)
+            sftp.put(local_ctx_py_path, os.path.join(base_dir, 'cloudify.py'))
+        _run_command(client, 'chmod +x {0}'.format(remote_ctx_path))
 
-    wrapped_ctx = _CtxWrapper(ctx, client)
+    out, _err = _run_command(client, 'mktemp -d --tmpdir={0}'.format(work_dir))
+    remote_script_dir = out.strip()
+    remote_script_path = os.path.join(remote_script_dir, 'script')
+    with client.open_sftp() as sftp:
+        sftp.put(script_path, remote_script_path)
+    _run_command(client, 'chmod +x {0}'.format(remote_script_path))
 
-    envvars_path = os.path.join(base_dir, 'envvars')
+    wrapped_ctx = _CtxWrapper(ctx, client, remote_script_dir)
+
     ctx_id = uuid.uuid4().hex
     proxy.contexts[ctx_id] = wrapped_ctx
-    with sftp.open(envvars_path, 'w') as f:
-        f.write('export CTX_SOCKET_URL={0}\n'.format(proxy.proxy_url))
-        f.write('export PATH={0}:/sbin:$PATH\n'.format(base_dir))
-        f.write('export CTX_ID={0}\n'.format(ctx_id))
-        if env:
-            for k, v in env.items():
-                f.write('export {0}={1}\n'.format(k, v))
 
-    cmd = 'source {0} && {1} {2}'.format(
-        envvars_path,
-        'sudo' if use_sudo else '',
-        os.path.join(base_dir, script_filename))
-    script_in, script_out, script_err = client.exec_command(cmd)
-    if stdin is not None:
-        script_in.write(stdin)
-    stdout = script_out.read()
-    stderr = script_err.read()
+    cmd = '{0}{1}'.format('sudo ' if use_sudo else '', remote_script_path)
+    if env is None:
+        env = {}
+    env.update({
+        'CTX_SOCKET_URL': '{0}?id={1}'.format(proxy.proxy_url, ctx_id),
+        'PATH': '{0}:/sbin:$PATH'.format(base_dir),
+        'PYTHONPATH': '{0}:$PYTHONPATH'.format(base_dir)
+    })
+    try:
+        stdout, stderr = _run_command(client, cmd, stdin=stdin, env=env)
+    except RemoteProcessError as e:
+        raise ScriptException(e.stderr)
+    finally:
+        _run_command(client, 'rm -fr {0}'.format(remote_script_dir))
+        proxy.contexts.pop(ctx_id)
+
     sys.stdout.write(stdout)
     sys.stderr.write(stderr)
-    client.exec_command('rm -fr {0}'.format(base_dir))
 
-    sftp.close()
-    proxy.contexts.pop(ctx_id)
-
-    if script_out.channel.recv_exit_status() != 0:
-        ctx.logger.error(stdout)
-        raise ScriptException(stderr)
     return handle_script_result(wrapped_ctx)
 
 
