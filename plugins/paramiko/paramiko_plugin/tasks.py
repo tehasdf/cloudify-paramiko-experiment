@@ -23,8 +23,9 @@ _NOTHING = object()
 
 
 class RemoteProcessError(Exception):
-    def __init__(self, stdout, stderr):
+    def __init__(self, status, stdout, stderr):
         super(RemoteProcessError, self).__init__()
+        self.status = status
         self.stdout = stdout
         self.stderr = stderr
 
@@ -210,11 +211,11 @@ def _run_command(client, cmd, stdin=None, env=None):
         cmd_in.write(stdin)
     out = cmd_out.read()
     err = cmd_err.read()
-    status = cmd_out.channel.recv_exit_status(),
+    status = cmd_out.channel.recv_exit_status()
     if env_script:
         _run_command(client, 'rm {0}'.format(env_script))
     if status != 0:
-        raise RemoteProcessError(cmd)
+        raise RemoteProcessError(status, out, err)
     return out, err
 
 
