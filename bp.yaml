@@ -24,3 +24,8 @@ node_templates:
               key_filename: /home/lukasz/projects/cli_work/vm/.vagrant/machines/default/virtualbox/private_key
               hostname: 10.0.1.25
               look_for_keys: false
+    capabilities:
+      scalable:
+        properties:
+          default_instances: 5
+ 

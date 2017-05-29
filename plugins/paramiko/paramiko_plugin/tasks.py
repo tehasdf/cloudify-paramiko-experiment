@@ -1,5 +1,6 @@
 import os
 import sys
+import uuid
 import threading
 import requests
 import tempfile
@@ -21,9 +22,9 @@ ILLEGAL_CTX_OPERATION_ERROR = RuntimeError('ctx may only abort or return once')
 _NOTHING = object()
 
 
-class NetstringCtxProxy(CtxProxy):
-    def __init__(self, ctx):
-        super(NetstringCtxProxy, self).__init__(ctx, None)
+class NetstringMultiCtxProxy(object):
+    def __init__(self):
+        self.contexts = {}
 
     def handle(self, sock, *a):
         t = threading.Thread(target=self._handle_connection, args=(sock, ))
@@ -31,7 +32,9 @@ class NetstringCtxProxy(CtxProxy):
 
     def _handle_connection(self, sock):
         ns = self._get_netstring(sock)
-        resp = self.process(ns)
+        ctx_id, _, ns = ns.partition('\x00')
+        ctx = self.contexts[ctx_id]
+        resp = CtxProxy(ctx, '').process(ns)
         resp = '{0}:{1},'.format(len(resp), resp)
         sent = 0
         while sent < len(resp):
@@ -154,7 +157,8 @@ class _CtxWrapper(object):
 
 
 def with_client(f):
-    cache = threading.local()
+    cache = {}
+    connect_lock = threading.Lock()
 
     def _rename_kwargs(env):
         renames = [
@@ -174,16 +178,20 @@ def with_client(f):
         key = (ssh_env['hostname'],
                ssh_env.get('port', 22),
                ssh_env['username'])
-        if not hasattr(cache, 'connections'):
-            cache.connections = {}
-        if key not in cache.connections or no_cache:
-            client = SSHClient()
-            client.set_missing_host_key_policy(WarningPolicy())
-            client.connect(**ssh_env)
-            if no_cache:
-                return f(*args, **kwargs)
-            cache.connections[key] = client
-        kwargs['client'] = cache.connections[key]
+        with connect_lock:
+            if key not in cache or no_cache:
+                client = SSHClient()
+                client.set_missing_host_key_policy(WarningPolicy())
+                client.connect(**ssh_env)
+                if no_cache:
+                    return f(*args, **kwargs)
+                proxy = NetstringMultiCtxProxy()
+                transport = client.get_transport()
+                port = transport.request_port_forward('127.0.0.1', 0,
+                                                      proxy.handle)
+                proxy.proxy_url = 'netstring://127.0.0.1:{0}'.format(port)
+                cache[key] = (client, proxy)
+            kwargs['client'], kwargs['proxy'] = cache[key]
         try:
             return f(*args, **kwargs)
         finally:
@@ -193,8 +201,8 @@ def with_client(f):
 
 
 @with_client
-def run_script(ctx, script_path, client, env=None, use_sudo=False, stdin=None,
-               **kwargs):
+def run_script(ctx, script_path, client, proxy, env=None, use_sudo=False,
+               stdin=None, **kwargs):
     _in, out, _err = client.exec_command('mktemp -d --tmpdir=/tmp cfy.XXXXXX')
     base_dir = out.read().strip()
     sftp = client.open_sftp()
@@ -214,15 +222,14 @@ def run_script(ctx, script_path, client, env=None, use_sudo=False, stdin=None,
         client.exec_command('chmod +x {0}'.format(remote_script_path))
 
     wrapped_ctx = _CtxWrapper(ctx, client)
-    proxy = NetstringCtxProxy(wrapped_ctx)
 
-    transport = client.get_transport()
-    port = transport.request_port_forward('127.0.0.1', 0, proxy.handle)
-    proxy_url = 'netstring://127.0.0.1:{0}'.format(port)
     envvars_path = os.path.join(base_dir, 'envvars')
+    ctx_id = uuid.uuid4().hex
+    proxy.contexts[ctx_id] = wrapped_ctx
     with sftp.open(envvars_path, 'w') as f:
-        f.write('export CTX_SOCKET_URL={0}\n'.format(proxy_url))
+        f.write('export CTX_SOCKET_URL={0}\n'.format(proxy.proxy_url))
         f.write('export PATH={0}:/sbin:$PATH\n'.format(base_dir))
+        f.write('export CTX_ID={0}\n'.format(ctx_id))
         if env:
             for k, v in env.items():
                 f.write('export {0}={1}\n'.format(k, v))
@@ -239,8 +246,9 @@ def run_script(ctx, script_path, client, env=None, use_sudo=False, stdin=None,
     sys.stdout.write(stdout)
     sys.stderr.write(stderr)
     client.exec_command('rm -fr {0}'.format(base_dir))
-    transport.cancel_port_forward('127.0.0.1', port)
+
     sftp.close()
+    proxy.contexts.pop(ctx_id)
 
     if script_out.channel.recv_exit_status() != 0:
         ctx.logger.error(stdout)
